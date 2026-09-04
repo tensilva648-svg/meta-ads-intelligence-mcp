@@ -29,9 +29,43 @@ function safeEqual(a: string, b: string) {
 function auth(req: express.Request, res: express.Response, next: express.NextFunction) {
   const header = String(req.headers.authorization || "");
   if (!header.startsWith("Bearer ") || !safeEqual(header.slice(7), MCP_BEARER_TOKEN)) {
+    const base = `${req.protocol}://${req.get("host")}`;
+    res.setHeader(
+      "WWW-Authenticate",
+      `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource"`
+    );
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
+}
+
+// --- Minimal OAuth 2.1 + PKCE + Dynamic Client Registration shim ---
+// Claude's remote-connector UI requires an OAuth login flow before it will
+// call /mcp. This server only has a single static MCP_BEARER_TOKEN, so this
+// shim implements just enough OAuth to satisfy that flow: it auto-approves
+// the authorization request and hands back the existing MCP_BEARER_TOKEN as
+// the access_token. It does not add a second secret to protect — the real
+// protection is still the bearer token itself.
+
+type AuthCodeEntry = {
+  code_challenge: string;
+  code_challenge_method: string;
+  redirect_uri: string;
+  expires: number;
+};
+
+const AUTH_CODES = new Map<string, AuthCodeEntry>();
+const REGISTERED_CLIENTS = new Map<string, { redirect_uris: string[] }>();
+
+function randomToken(bytes = 32) {
+  return crypto.randomBytes(bytes).toString("base64url");
+}
+
+function cleanupExpiredCodes() {
+  const now = Date.now();
+  for (const [code, entry] of AUTH_CODES) {
+    if (entry.expires < now) AUTH_CODES.delete(code);
+  }
 }
 
 function metaConfigured() {
@@ -291,6 +325,106 @@ app.use(express.json({ limit: "1mb" }));
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "meta-ads-intelligence-mcp", version: "0.2.0" });
 });
+
+app.get("/.well-known/oauth-protected-resource", (req, res) => {
+  const base = `${req.protocol}://${req.get("host")}`;
+  res.json({
+    resource: `${base}/mcp`,
+    authorization_servers: [base]
+  });
+});
+
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const base = `${req.protocol}://${req.get("host")}`;
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/authorize`,
+    token_endpoint: `${base}/token`,
+    registration_endpoint: `${base}/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256", "plain"],
+    token_endpoint_auth_methods_supported: ["none"]
+  });
+});
+
+app.post("/register", (req, res) => {
+  const client_id = randomToken(16);
+  const redirect_uris = Array.isArray(req.body?.redirect_uris) ? req.body.redirect_uris : [];
+  REGISTERED_CLIENTS.set(client_id, { redirect_uris });
+  res.status(201).json({
+    client_id,
+    redirect_uris,
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code"],
+    response_types: ["code"]
+  });
+});
+
+app.get("/authorize", (req, res) => {
+  cleanupExpiredCodes();
+  const redirect_uri = String(req.query.redirect_uri || "");
+  const state = req.query.state ? String(req.query.state) : "";
+  const code_challenge = req.query.code_challenge ? String(req.query.code_challenge) : "";
+  const code_challenge_method = req.query.code_challenge_method
+    ? String(req.query.code_challenge_method)
+    : "plain";
+
+  if (!redirect_uri) return res.status(400).send("Missing redirect_uri");
+
+  const code = randomToken(24);
+  AUTH_CODES.set(code, {
+    code_challenge,
+    code_challenge_method,
+    redirect_uri,
+    expires: Date.now() + 5 * 60 * 1000
+  });
+
+  const url = new URL(redirect_uri);
+  url.searchParams.set("code", code);
+  if (state) url.searchParams.set("state", state);
+  res.redirect(url.toString());
+});
+
+app.post(
+  "/token",
+  express.urlencoded({ extended: true }),
+  (req, res) => {
+    cleanupExpiredCodes();
+    const grant_type = req.body?.grant_type;
+    const code = req.body?.code;
+    const code_verifier = req.body?.code_verifier;
+
+    if (grant_type !== "authorization_code") {
+      return res.status(400).json({ error: "unsupported_grant_type" });
+    }
+
+    const entry = code ? AUTH_CODES.get(code) : undefined;
+    if (!entry || entry.expires < Date.now()) {
+      return res.status(400).json({ error: "invalid_grant" });
+    }
+    AUTH_CODES.delete(code);
+
+    if (entry.code_challenge) {
+      if (!code_verifier) {
+        return res.status(400).json({ error: "invalid_grant", error_description: "missing code_verifier" });
+      }
+      let check = String(code_verifier);
+      if (entry.code_challenge_method === "S256") {
+        check = crypto.createHash("sha256").update(check).digest("base64url");
+      }
+      if (check !== entry.code_challenge) {
+        return res.status(400).json({ error: "invalid_grant", error_description: "PKCE mismatch" });
+      }
+    }
+
+    res.json({
+      access_token: MCP_BEARER_TOKEN,
+      token_type: "Bearer",
+      expires_in: 31536000
+    });
+  }
+);
 
 app.all("/mcp", auth, async (req, res) => {
   try {
