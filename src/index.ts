@@ -382,14 +382,16 @@ function buildServer() {
       billing_event: z.string().default("IMPRESSIONS"),
       optimization_goal: z.string().min(1),
       targeting: z.record(z.any()),
+      promoted_object: z.record(z.any()).optional(),
+      attribution_spec: z.array(z.record(z.any())).optional(),
       start_time: z.string().optional(),
       end_time: z.string().optional(),
       confirmed: z.boolean().default(false)
     },
-    async ({ campaign_id, name, daily_budget_cents, lifetime_budget_cents, billing_event, optimization_goal, targeting, start_time, end_time, confirmed }) => {
+    async ({ campaign_id, name, daily_budget_cents, lifetime_budget_cents, billing_event, optimization_goal, targeting, promoted_object, attribution_spec, start_time, end_time, confirmed }) => {
       const preview = {
         campaign_id, name, daily_budget_cents, lifetime_budget_cents,
-        billing_event, optimization_goal, targeting, start_time, end_time,
+        billing_event, optimization_goal, targeting, promoted_object, attribution_spec, start_time, end_time,
         status: "PAUSED" as const
       };
       if (!ALLOW_MUTATIONS) {
@@ -408,6 +410,8 @@ function buildServer() {
       };
       if (daily_budget_cents) params.daily_budget = String(daily_budget_cents);
       if (lifetime_budget_cents) params.lifetime_budget = String(lifetime_budget_cents);
+      if (promoted_object) params.promoted_object = JSON.stringify(promoted_object);
+      if (attribution_spec) params.attribution_spec = JSON.stringify(attribution_spec);
       if (start_time) params.start_time = start_time;
       if (end_time) params.end_time = end_time;
       return result(await metaRequest("POST", `${META_ACCOUNT}/adsets`, params));
